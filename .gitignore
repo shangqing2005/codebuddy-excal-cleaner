@@ -1,0 +1,36 @@
+# 可执行文件和压缩包
+*.exe
+*.zip
+*.tar.gz
+
+# 打包目录
+打包/
+
+# 旧版本
+以前的版本/
+以前的压缩包/
+
+# 处理日志
+*_processing_log.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 临时文件
+*.tmp
+*.bak
+*.exe~
+.DS_Store
