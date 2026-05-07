@@ -370,11 +370,13 @@ class AutoSelectDialog:
         top_label.pack(anchor="w", padx=10, pady=(8, 4))
 
         # 列单元格滚动容器
-        self.col_scroll = ctk.CTkScrollableFrame(top_frame, fg_color="transparent", height=70)
+        self.col_scroll = ctk.CTkScrollableFrame(top_frame, fg_color="transparent", height=140)
         self.col_scroll.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self.column_cells = {}  # {col_idx: outer_frame}
 
         headers = self.all_headers_cache[self.max_sheet]
+        # 每行显示10列，超出自动换行，利用垂直滚动全部可见
+        cols_per_row = 10
         for idx in range(len(headers)):
             col_letter = get_column_letter(idx + 1)
             cell = ctk.CTkFrame(self.col_scroll, corner_radius=6,
@@ -386,7 +388,10 @@ class AutoSelectDialog:
             label.pack(padx=4, pady=4)
             cell.bind("<Button-1>", lambda e, i=idx: self._on_column_click(i))
             label.bind("<Button-1>", lambda e, i=idx: self._on_column_click(i))
-            cell.pack(side="left", padx=2, pady=2)
+            # 使用grid网格布局，每cols_per_row列自动换行
+            row = idx // cols_per_row
+            col = idx % cols_per_row
+            cell.grid(row=row, column=col, padx=2, pady=2)
             self.column_cells[idx] = cell
 
         # ========== 中间：三个按钮 ==========
@@ -830,7 +835,7 @@ class ExcelDeduplicationTool:
                      font=ctk.CTkFont(size=FONT_SIZE_TITLE, weight="bold", family=FONT_FAMILY),
                      text_color=COLOR_TEXT_PRIMARY).grid(row=0, column=0, sticky="w", pady=(0, 3))
 
-        ctk.CTkLabel(file_frame, text="当前版本：V0.7",
+        ctk.CTkLabel(file_frame, text="当前版本：V1.0",
                      font=ctk.CTkFont(size=12, family=FONT_FAMILY),
                      text_color=COLOR_TEXT_MUTED).grid(row=0, column=1, sticky="e", pady=(0, 3))
 
@@ -2877,6 +2882,29 @@ class ExcelDeduplicationTool:
             dups = rr.get("total_dups", 0)
             tms = rr.get("time_ms", 0)
             self._log(f"      [{sn}] 发现 {dups} 个重复项, 耗时 {tms:.0f}ms")
+
+        # 显示阶段2实际删除结果（JSON内嵌诊断）
+        stage2_diag = result.get("stage2_diag", [])
+        if stage2_diag:
+            total_skipped = 0
+            for d in stage2_diag:
+                sn = d.get("sheet_name", "?")
+                kept = d.get("kept_count", 0)
+                skipped = d.get("skipped_count", 0)
+                total = d.get("total_rows", 0)
+                orig = d.get("original_size", 0)
+                res = d.get("result_size", 0)
+                total_skipped += skipped
+                if skipped > 0:
+                    self._log(f"      ⛔ [{sn}] 阶段2: 保留{kept}行/删除{skipped}重复, 原始行数{total}, 大小{orig}→{res}")
+                else:
+                    self._log(f"      ⚠ [{sn}] 阶段2: 保留{kept}行/删除0重复(未生效), 原始行数{total}")
+            self._log(f"      📊 阶段2合计: 删除{total_skipped}个重复行")
+        else:
+            # 诊断：stage2_diag为空的可能原因
+            has_diag_key = "stage2_diag" in result
+            all_keys = list(result.keys())
+            self._log(f"      ⚠ 阶段2诊断: stage2_diag{'存在但为空' if has_diag_key else '不存在(未设置)'}, JSON字段={all_keys}")
 
         return True
 

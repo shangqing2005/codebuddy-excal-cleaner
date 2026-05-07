@@ -77,6 +77,16 @@ type TaskResult struct {
 	TotalDups    int              `json:"total_dups,omitempty"`
 	MemoryMB     float64          `json:"memory_mb,omitempty"`
 	RuleResults  []PerRuleResult  `json:"rule_results,omitempty"`
+	Stage2Diag   []Stage2SheetResult `json:"stage2_diag,omitempty"` // 新增：阶段2每个sheet的处理结果
+}
+
+type Stage2SheetResult struct {
+	SheetName    string `json:"sheet_name"`
+	KeptCount    int    `json:"kept_count"`
+	SkippedCount int    `json:"skipped_count"`
+	TotalRows    int    `json:"total_rows"`
+	OriginalSize int    `json:"original_size"`
+	ResultSize   int    `json:"result_size"`
 }
 
 type PerRuleResult struct {
@@ -235,16 +245,63 @@ func executeFullPipeline(raw map[string]interface{}) TaskResult {
 
 	if len(sheetMods) > 0 {
 		batchStart := currentTimeMs()
-		err := batchShiftUpXML(input.FilePath, sheetMods)
+		stage2Diags, err := batchShiftUpXML(input.FilePath, sheetMods)
 		batchMs := currentTimeMs() - batchStart
 
 		if err != nil {
 			return failResult(fmt.Sprintf("批量上移失败: %v", err))
 		}
+		result.Stage2Diag = stage2Diags
 		result.ModifiedRows = len(sheetMods)
 		memMB := getMemoryMB()
 		fmt.Fprintf(os.Stderr, "[INFO] 上移完成! %d个Sheet, 耗时%.0fms, 内存%.0fMB\n",
 			len(sheetMods), batchMs, memMB)
+
+		// ====== 后验证：重新扫描输出文件，检查剩余重复数 ======
+		if len(input.Rules) > 0 {
+			// ====== 直接读取ZIP确认行数 ======
+			if zr, zErr := zip.OpenReader(input.FilePath); zErr == nil {
+				for _, zf := range zr.File {
+					if strings.Contains(zf.Name, "sheet") && strings.HasSuffix(zf.Name, ".xml") {
+						rc, _ := zf.Open()
+						data, _ := io.ReadAll(rc)
+						rc.Close()
+						rowCount := strings.Count(string(data), `<row`)
+						fmt.Fprintf(os.Stderr, "[VERIFY-ZIP] %s: %d个<row>\n", zf.Name, rowCount)
+					}
+				}
+				zr.Close()
+			}
+			// ==================================
+
+			// ====== 双重验证：先excelize扫描，再重新打开一次 ======
+			for verifyPass := 0; verifyPass < 3; verifyPass++ {
+				f2, err2 := excelize.OpenFile(input.FilePath)
+				if err2 != nil {
+					fmt.Fprintf(os.Stderr, "[VERIFY] 第%d次无法打开: %v\n", verifyPass+1, err2)
+					continue
+				}
+				totalRemainingDups := 0
+				verifySeen := make(map[string]struct{})
+				for _, rule := range input.Rules {
+					_, verifyTotal, verifyDups := scanDuplicates(f2, rule,
+						func() map[string]struct{} { return verifySeen }, input.SkipHeader)
+					if verifyTotal > 0 {
+						if verifyDups > 0 {
+							totalRemainingDups += verifyDups
+						}
+					}
+				}
+				f2.Close()
+				fmt.Fprintf(os.Stderr, "[VERIFY] 第%d次扫描: 共计%d个剩余重复\n",
+					verifyPass+1, totalRemainingDups)
+				if verifyPass == 0 {
+					if newFi, _ := os.Stat(input.FilePath); newFi != nil {
+						fmt.Fprintf(os.Stderr, "[VERIFY-SIZE] 处理后文件大小=%d字节\n", newFi.Size())
+					}
+				}
+			}
+		}
 	}
 
 	result.RuleResults = ruleResults
@@ -261,7 +318,8 @@ func scanDuplicates(f *excelize.File, rule RuleDef,
 	dupSet := make(map[int]bool)
 	totalRows := 0
 	rowIdx := 0
-	dupCount := 0
+		dupCount := 0
+		mismatchTotal := 0 // physicalRow != rowIdx 次数
 
 	// 轻量级采样：每个Sheet只记录少量key用于诊断
 	const sampleSize = 3
@@ -348,7 +406,7 @@ func scanDuplicates(f *excelize.File, rule RuleDef,
 			}
 			if matched {
 				if _, exists := seen[key]; exists {
-					dupSet[physicalRow+1] = true // +1 转为1-based，与XML r="N" 对齐
+					dupSet[physicalRow] = true // 与XML r="N" 对齐（curRow已是1-based）
 					dupCount++
 					traceLog(physicalRow, rawVal, normVal, key, true, "重复命中")
 				} else {
@@ -362,7 +420,7 @@ func scanDuplicates(f *excelize.File, rule RuleDef,
 		}
 
 		if _, exists := seen[key]; exists {
-			dupSet[physicalRow+1] = true // +1 转为1-based，与XML r="N" 对齐
+			dupSet[physicalRow] = true // 与XML r="N" 对齐（curRow已是1-based）
 			dupCount++
 			// 采集前N个重复key样本
 			if len(dupKeySamples) < sampleSize {
@@ -389,6 +447,11 @@ func scanDuplicates(f *excelize.File, rule RuleDef,
 		}
 		rowIdx++
 
+		// 诊断：统计 physicalRow != rowIdx 的次数
+		if physicalRow != rowIdx {
+			mismatchTotal++
+		}
+
 		if rowIdx%10000 == 0 {
 			fmt.Fprintf(os.Stderr, "[PROGRESS] 「%s」已扫描 %d 行...\n", rule.SheetName, rowIdx)
 		}
@@ -410,6 +473,10 @@ func scanDuplicates(f *excelize.File, rule RuleDef,
 		fmt.Fprintf(os.Stderr, "[SAMPLE]   首key hex: %x\n", firstKeys[0])
 	}
 	fmt.Fprintf(os.Stderr, "[SAMPLE] === 摘要结束 ===\n")
+	if mismatchTotal > 0 {
+		fmt.Fprintf(os.Stderr, "[DUPKEY-DEBUG] 「%s」共%d次 physicalRow != rowIdx (总行%d)\n",
+			rule.SheetName, mismatchTotal, rowIdx)
+	}
 
 	return dupSet, totalRows, dupCount
 }
@@ -578,45 +645,74 @@ func currentTimeMs() float64 { return float64(time.Now().UnixNano()) / 1e6 }
 // =============================================================================
 
 // batchShiftUpXML 批量处理多个 Sheet 的真正上移
-func batchShiftUpXML(xlsxPath string, mods []SheetMod) error {
+func batchShiftUpXML(xlsxPath string, mods []SheetMod) ([]Stage2SheetResult, error) {
 	modMap := make(map[string]SheetMod)
 	for _, m := range mods {
 		modMap[m.SheetName] = m
 	}
+	var diags []Stage2SheetResult
 
 	reader, err := zip.OpenReader(xlsxPath)
 	if err != nil {
-		return fmt.Errorf("无法打开ZIP: %v", err)
+		return nil, fmt.Errorf("无法打开ZIP: %v", err)
 	}
 	sheetFileMap := buildSheetFileMap(&reader.Reader)
 	reader.Close()
 	if sheetFileMap == nil {
-		return fmt.Errorf("解析sheet映射失败")
+		return nil, fmt.Errorf("解析sheet映射失败")
 	}
 
 	fmt.Fprintf(os.Stderr, "[INFO] 发现%d个sheet, 需修改%d个\n", len(sheetFileMap), len(mods))
+	// 输出sheet文件路径映射用于诊断
+	for sName, zPath := range sheetFileMap {
+		if mod, ok := modMap[sName]; ok {
+			fmt.Fprintf(os.Stderr, "[INFO]   匹配: 「%s」→%s (DupCount=%d)\n", sName, zPath, mod.DupCount)
+		} else {
+			fmt.Fprintf(os.Stderr, "[INFO]   跳过: 「%s」→%s (无规则)\n", sName, zPath)
+		}
+	}
+	os.Stderr.Sync()
 
 	tmpPath := xlsxPath + ".tmp"
 	destFile, err := os.Create(tmpPath)
 	if err != nil {
-		return fmt.Errorf("创建临时文件: %v", err)
+		return nil, fmt.Errorf("创建临时文件: %v", err)
 	}
 	zipWriter := zip.NewWriter(destFile)
 
 	reader, err = zip.OpenReader(xlsxPath)
 	if err != nil {
-		return fmt.Errorf("重新打开ZIP: %v", err)
+		return nil, fmt.Errorf("重新打开ZIP: %v", err)
 	}
 	defer reader.Close()
 
+	// 诊断：打印所有ZIP条目路径，确认路径格式
+	fmt.Fprintf(os.Stderr, "[INFO]   ZIP条目路径预览(共%d个):\n", len(reader.File))
+	for i, f := range reader.File {
+		if i >= 20 && i < len(reader.File)-5 { continue } // 只显示前20和后5
+		fmt.Fprintf(os.Stderr, "[INFO]     [%d] %s\n", i, f.Name)
+	}
+
 	for _, srcFile := range reader.File {
 		var targetMod *SheetMod
+		// 修复：规范化路径名比较（正斜杠vs反斜杠）
+		normalizedSrcName := strings.ReplaceAll(srcFile.Name, "\\", "/")
 		for sName, zPath := range sheetFileMap {
-			if srcFile.Name == zPath {
+			normalizedZPath := strings.ReplaceAll(zPath, "\\", "/")
+			if normalizedSrcName == normalizedZPath {
 				if mod, ok := modMap[sName]; ok && mod.DupCount > 0 {
 					targetMod = &mod
 				}
 				break
+			}
+		}
+
+		// 诊断：检查sheet文件是否匹配
+		if strings.HasPrefix(srcFile.Name, "xl/worksheets/sheet") || strings.HasPrefix(srcFile.Name, "xl\\worksheets\\sheet") {
+			if targetMod == nil {
+				fmt.Fprintf(os.Stderr, "[DEBUG]   ⚠ 未匹配: %s (sheetFileMap中无对应路径)\n", srcFile.Name)
+			} else {
+				fmt.Fprintf(os.Stderr, "[DEBUG]   ✓ 已匹配: %s → %s (跳过%d重复)\n", srcFile.Name, targetMod.SheetName, targetMod.DupCount)
 			}
 		}
 
@@ -638,13 +734,15 @@ func batchShiftUpXML(xlsxPath string, mods []SheetMod) error {
 			fmt.Fprintf(os.Stderr, "[INFO] 正在处理「%s」(%s): %d重复×%d列...\n",
 				targetMod.SheetName, srcFile.Name, targetMod.DupCount, len(targetMod.GreenCols))
 
-			modifiedXML := shiftUpSheetXML(xmlData, *targetMod)
+			modifiedXML, diag := shiftUpSheetXML(xmlData, *targetMod)
+			diags = append(diags, diag)
 			writer.Write(modifiedXML)
 
 			memMB := getMemoryMB()
-			fmt.Fprintf(os.Stderr, "[INFO]   「%s」完成, 内存%.0fMB\n", targetMod.SheetName, memMB)
+			fmt.Fprintf(os.Stderr, "[INFO]   「%s」完成: 保留%d行/跳过%d重复, 内存%.0fMB\n",
+				targetMod.SheetName, diag.KeptCount, diag.SkippedCount, memMB)
 			if memMB > 1500 {
-				return fmt.Errorf("内存过高(%.0fMB)，建议拆分文件", memMB)
+				return diags, fmt.Errorf("内存过高(%.0fMB)，建议拆分文件", memMB)
 			}
 		} else {
 			rc, _ := srcFile.Open()
@@ -660,31 +758,127 @@ func batchShiftUpXML(xlsxPath string, mods []SheetMod) error {
 	reader.Close()
 	os.Remove(xlsxPath)
 	if err := os.Rename(tmpPath, xlsxPath); err != nil {
-		return fmt.Errorf("替换文件: %v", err)
+		return diags, fmt.Errorf("替换文件: %v", err)
 	}
-	return nil
+	return diags, nil
 }
 
-// buildSheetFileMap 从 workbook.xml 提取 sheet名→XML路径映射
+// buildSheetFileMap 从 workbook.xml + workbook.xml.rels 提取 sheet名→XML路径映射
+// 注意：必须使用 r:id（关系ID）而非 sheetId，因为 sheetId 只是逻辑编号
 func buildSheetFileMap(reader *zip.Reader) map[string]string {
 	result := make(map[string]string)
+	var wbData string
+	var relsData string
+
 	for _, f := range reader.File {
-		if f.Name == "xl/workbook.xml" || f.Name == "xl\\workbook.xml" {
+		name := strings.ReplaceAll(f.Name, "\\", "/")
+		if name == "xl/workbook.xml" {
 			rc, err := f.Open()
 			if err != nil {
 				continue
 			}
 			data, _ := io.ReadAll(rc)
 			rc.Close()
-			extractSheets(string(data), result)
-			break
+			wbData = string(data)
+		}
+		if name == "xl/_rels/workbook.xml.rels" {
+			rc, err := f.Open()
+			if err != nil {
+				continue
+			}
+			data, _ := io.ReadAll(rc)
+			rc.Close()
+			relsData = string(data)
 		}
 	}
+
+	if wbData == "" || relsData == "" {
+		// 降级：使用旧的 sheetId 逻辑（可能路径不对，但比空映射好）
+		extractSheetsOld(wbData, result)
+		return result
+	}
+
+	// 1. 从 workbook.xml 提取 sheet名 → rId 映射
+	sheetRIDMap := make(map[string]string) // sheetName → rId
+	pat := `<sheet name="`
+	i := 0
+	for {
+		s := strings.Index(wbData[i:], pat)
+		if s < 0 {
+			break
+		}
+		s += i + len(pat)
+		e := strings.Index(wbData[s:], `"`)
+		if e < 0 {
+			break
+		}
+		name := wbData[s : s+e]
+		// 提取 r:id="rIdN"
+		ridPat := `r:id="`
+		ri := strings.Index(wbData[s+e:], ridPat)
+		if ri < 0 {
+			ri = strings.Index(wbData[s+e:], `r:id = "`)
+			if ri < 0 { ri = 0 } else { ri += len(`r:id = "`) }
+		} else {
+			ri += len(ridPat)
+		}
+		if ri > 0 {
+			re := strings.Index(wbData[s+e+ri:], `"`)
+			if re >= 0 {
+				rid := wbData[s+e+ri : s+e+ri+re]
+				sheetRIDMap[name] = rid
+			}
+		}
+		i = s + e
+	}
+
+	// 2. 从 workbook.xml.rels 提取 rId → Target 映射
+	ridPathMap := make(map[string]string) // rId → Target
+	relPat := `Id="`
+	j := 0
+	for {
+		s := strings.Index(relsData[j:], relPat)
+		if s < 0 {
+			break
+		}
+		s += j + len(relPat)
+		e := strings.Index(relsData[s:], `"`)
+		if e < 0 {
+			break
+		}
+		rid := relsData[s : s+e]
+		// 提取 Target="..."
+		tgtPat := `Target="`
+		ti := strings.Index(relsData[s+e:], tgtPat)
+		if ti < 0 {
+			j = s + e
+			continue
+		}
+		ti += s + e + len(tgtPat)
+		te := strings.Index(relsData[ti:], `"`)
+		if te < 0 {
+			break
+		}
+		target := relsData[ti : ti+te]
+		ridPathMap[rid] = target
+		j = s + e
+	}
+
+	// 3. 组合：sheet名 → xl/ + Target
+	for sName, rid := range sheetRIDMap {
+		if target, ok := ridPathMap[rid]; ok {
+			// Target 可能是 "worksheets/sheet7.xml" 或 "./worksheets/sheet7.xml"
+			target = strings.TrimPrefix(target, "./")
+			result[sName] = "xl/" + target
+		}
+	}
+
 	return result
 }
 
-// extractSheets 解析 workbook.xml 填充映射
-func extractSheets(wb string, result map[string]string) {
+// extractSheetsOld 降级方案：使用 sheetId（可能路径不对）
+func extractSheetsOld(wb string, result map[string]string) {
+	if wb == "" { return }
 	pat := `<sheet name="`
 	i := 0
 	for {
@@ -718,7 +912,7 @@ func extractSheets(wb string, result map[string]string) {
 // 算法：以 <row> 为单位切分，同步改 <row r="N"> + 内部所有 <c r="XN">
 //
 //	重复行的整个 <row> 块删除 → 和 Python ElementTree 移动效果一致
-func shiftUpSheetXML(xmlData []byte, mod SheetMod) []byte {
+func shiftUpSheetXML(xmlData []byte, mod SheetMod) ([]byte, Stage2SheetResult) {
 	content := string(xmlData)
 	
 	fmt.Fprintf(os.Stderr, "[START] 开始处理SheetXML，数据大小=%d字节, 重复数=%d\n", len(content), mod.DupCount)
@@ -726,17 +920,55 @@ func shiftUpSheetXML(xmlData []byte, mod SheetMod) []byte {
 	// 定位 <sheetData> ... </sheetData> 区域
 	sdStart := strings.Index(content, `<sheetData`)
 	if sdStart < 0 {
-		return xmlData
+		return xmlData, Stage2SheetResult{SheetName: mod.SheetName, OriginalSize: len(xmlData), ResultSize: len(xmlData), TotalRows: 0, KeptCount: 0, SkippedCount: 0}
 	}
 	sdEnd := strings.Index(content, `</sheetData>`)
 	if sdEnd < 0 {
-		return xmlData
+		return xmlData, Stage2SheetResult{SheetName: mod.SheetName, OriginalSize: len(xmlData), ResultSize: len(xmlData), TotalRows: 0, KeptCount: 0, SkippedCount: 0}
 	}
 	sdClose := strings.Index(content[sdStart:], `>`) + sdStart
 
 	header := content[:sdClose+1]      // <sheetData ...>
 	footer := content[sdEnd:]          // </sheetData>
 	body := content[sdClose+1 : sdEnd] // 中间的 rows
+
+	// ====== 诊断：检查dupSet的key是否能在XML中找到对应的r="N" ======
+	fmt.Fprintf(os.Stderr, "[STAGE2-CHECK] 「%s」dupSet有%d个key, body有%d字节\n",
+		mod.SheetName, len(mod.DupSet), len(body))
+	missingInXML := 0
+	foundInXML := 0
+	sampleMissing := []int{}
+	for k := range mod.DupSet {
+		// 检查XML中是否有 r="k" 或 r='k'
+		target1 := fmt.Sprintf(`r="%d"`, k)
+		target2 := fmt.Sprintf(`r='%d'`, k)
+		if strings.Contains(body, target1) || strings.Contains(body, target2) {
+			foundInXML++
+		} else {
+			missingInXML++
+			if len(sampleMissing) < 5 {
+				sampleMissing = append(sampleMissing, k)
+			}
+		}
+	}
+	fmt.Fprintf(os.Stderr, "[STAGE2-CHECK]   匹配XML: %d, 不匹配(空行导致): %d\n",
+		foundInXML, missingInXML)
+	if len(sampleMissing) > 0 {
+		fmt.Fprintf(os.Stderr, "[STAGE2-CHECK]   不匹配样本key: %v\n", sampleMissing)
+	}
+	// =========================================================================
+
+	// 阶段2追踪关键词（与阶段1共享同一环境变量）
+	stage2TraceKeywords := make(map[string]struct{})
+	if envVal := os.Getenv("DEDUP_TRACE_KEYWORDS"); envVal != "" {
+		for _, kw := range strings.Split(envVal, ",") {
+			kw = strings.TrimSpace(kw)
+			if kw != "" {
+				stage2TraceKeywords[kw] = struct{}{}
+			}
+		}
+	}
+	hasStage2Trace := len(stage2TraceKeywords) > 0
 
 	outputRow := 1
 	var builder strings.Builder
@@ -746,10 +978,17 @@ func shiftUpSheetXML(xmlData []byte, mod SheetMod) []byte {
 	rowCount := 0
 	skippedCount := 0
 	keptCount := 0
+	selfClosingCount := 0    // 自闭合行计数（不计入rowCount）
 	consecRecoveries := 0    // 连续恢复次数
 	lastRecoverPos := 0       // 上次恢复位置（检测微小步进）
 	const maxConsecRecoveries = 15 // 连续恢复上限
 	const minRecoverStep = 200     // 恢复最小步进(字节)
+
+	// 诊断：记录dupSet中哪些key在循环中被处理到
+	processedKeys := make(map[int]bool)
+	for k := range mod.DupSet {
+		processedKeys[k] = false
+	}
 
 	// 按行遍历
 	for offset := 0; offset < len(body); {
@@ -791,6 +1030,7 @@ func shiftUpSheetXML(xmlData []byte, mod SheetMod) []byte {
 				builder.WriteString(body[rs:scEnd])
 				offset = scEnd
 				consecRecoveries = 0 // 正常路径，重置
+				selfClosingCount++  // 自闭合行，不计入rowCount（不影响rowNum查找）
 				continue
 			}
 
@@ -885,16 +1125,50 @@ func shiftUpSheetXML(xmlData []byte, mod SheetMod) []byte {
 
 		fullRowBlock := body[rs:endRow]
 
-		rowNum := extractRowNum(body, rs, re)
+		rowNum := extractRowNum(body, rs, re) // 真实行号（给renumberRow做字符串替换用）
 		nxt := endRow
 
-		// 直接用物理行号查 DupSet（阶段1已改为用物理行号作为key）
-		if mod.DupSet[rowNum] {
+		// 用实际XML行号(r="N")查dupSet，与阶段1的physicalRow+1对齐
+		// 不能用rowCount+1，因为自闭合行(<row .../>)不递增rowCount，会导致偏移
+		//
+		// 诊断：标记processedKeys（检查哪些dupSet key被循环访问到）
+		if _, exists := processedKeys[rowNum]; exists {
+			processedKeys[rowNum] = true // 标记为"已处理"
+		}
+		//
+		// 诊断：当rowNum在dupSet中但值为false时打印详情
+		dupVal, keyExists := mod.DupSet[rowNum]
+		if keyExists && !dupVal {
+			fmt.Fprintf(os.Stderr, "[STAGE2-BUG] ⚡ rowNum=%d 在dupSet中但值为false! rowCount=%d rs=%d\n",
+				rowNum, rowCount, rs)
+		}
+		shouldDelete := dupVal && keyExists
+		if shouldDelete {
 			// 重复行：整行删除（不输出任何内容）
+			// 阶段2关键词追踪：输出被删除的行详情
+			if hasStage2Trace {
+				for kw := range stage2TraceKeywords {
+					if strings.Contains(fullRowBlock, kw) {
+						fmt.Fprintf(os.Stderr, "[TRACE2]  ⛔ 删除 rowCount=%d r=%d: 匹配关键词[%s] 行块=%d字节\n",
+							rowCount, rowNum, kw, len(fullRowBlock))
+						break
+					}
+				}
+			}
 			skippedCount++
 			rowCount++ // 也计入rowCount以正确触发progress日志
 		} else {
 			// 非重复行：重编号 <row r="N"> + 内部所有 <c r="?N">
+			// 阶段2关键词追踪：输出被保留的行详情
+			if hasStage2Trace {
+				for kw := range stage2TraceKeywords {
+					if strings.Contains(fullRowBlock, kw) {
+						fmt.Fprintf(os.Stderr, "[TRACE2]  ✅ 保留 rowCount=%d r=%d: 匹配关键词[%s] 行块=%d字节\n",
+							rowCount, rowNum, kw, len(fullRowBlock))
+						break
+					}
+				}
+			}
 			builder.WriteString(renumberRow(fullRowBlock, rowNum, outputRow))
 			outputRow++
 			keptCount++
@@ -914,6 +1188,16 @@ func shiftUpSheetXML(xmlData []byte, mod SheetMod) []byte {
 	originalSize := len(content)
 	resultStr := builder.String()
 
+	// 构建阶段2诊断信息（嵌入JSON结果，确保不被stderr缓冲问题影响）
+	diag := Stage2SheetResult{
+		SheetName:    mod.SheetName,
+		KeptCount:    keptCount,
+		SkippedCount: skippedCount,
+		TotalRows:    rowCount,
+		OriginalSize: originalSize,
+		ResultSize:   resultSize,
+	}
+
 	// ====== 诊断：全量XML结构完整性检查 ======
 	totalRows := strings.Count(resultStr, `<row`)
 	totalCells := strings.Count(resultStr, `<c `)
@@ -929,6 +1213,7 @@ func shiftUpSheetXML(xmlData []byte, mod SheetMod) []byte {
 		float64(resultSize)/1024, float64(originalSize)/1024, totalRows, totalCells, totalValues)
 	fmt.Fprintf(os.Stderr, "[DIAG] <sheetData>: %v, </sheetData>: %v\n", hasSheetDataOpen, hasSheetDataClose)
 	fmt.Fprintf(os.Stderr, "[DIAG] <c r=\" 格式正确: %d, 异常(缺失<): %d\n", hasCellR, brokenRefs)
+	fmt.Fprintf(os.Stderr, "[DIAG] 自闭合行: %d, body总行: %d(含重复)\n", selfClosingCount, rowCount)
 
 	// 提取前3个完整行块用于对比
 	if sheetDataPos >= 0 {
@@ -999,7 +1284,89 @@ func shiftUpSheetXML(xmlData []byte, mod SheetMod) []byte {
 			float64(resultSize)*100/float64(originalSize))
 	}
 
-	return []byte(builder.String())
+	// ====== 诊断：检查哪些dupSet key在循环中从未被处理到 ======
+	neverProcessed := 0
+	processedCount := 0
+	sampleNever := []int{}
+	for k, wasProcessed := range processedKeys {
+		if wasProcessed {
+			processedCount++
+		} else {
+			neverProcessed++
+			if len(sampleNever) < 10 {
+				sampleNever = append(sampleNever, k)
+			}
+		}
+	}
+	fmt.Fprintf(os.Stderr, "[STAGE2-PROCKEY] 循环中: 已处理%d个key, 未处理%d个key\n",
+		processedCount, neverProcessed)
+	if neverProcessed > 0 {
+		fmt.Fprintf(os.Stderr, "[STAGE2-PROCKEY]   未处理样本: %v\n", sampleNever)
+	}
+	// ===========================================================
+
+	// ====== 诊断：检查body中是否有重复的r="N"值 ======
+	dupRCount := 0
+	sampleDupR := []int{}
+	seenRValues := make(map[int]int) // r值 → count
+	scanPos := 0
+	for {
+		rowStart := strings.Index(body[scanPos:], `<row`)
+		if rowStart < 0 {
+			break
+		}
+		rowStart += scanPos
+		tagEnd := findTagEnd(body, rowStart)
+		if tagEnd < 0 {
+			break
+		}
+		rVal := extractRowNum(body, rowStart, tagEnd)
+		if rVal > 0 {
+			seenRValues[rVal]++
+			if seenRValues[rVal] > 1 {
+				dupRCount++
+				if len(sampleDupR) < 10 {
+					sampleDupR = append(sampleDupR, rVal)
+				}
+			}
+		}
+		// 移动到下一行
+		nextRowStart := strings.Index(body[tagEnd:], `<row`)
+		if nextRowStart < 0 {
+			break
+		}
+		scanPos = tagEnd + nextRowStart
+	}
+	if dupRCount > 0 {
+		fmt.Fprintf(os.Stderr, "[STAGE2-DUPR] ⚠ 发现%d个重复的r=值! 样本: %v\n", dupRCount, sampleDupR)
+	} else {
+		fmt.Fprintf(os.Stderr, "[STAGE2-DUPR] ✅ 所有r=值唯一 (共%d个不同的r值)\n", len(seenRValues))
+	}
+	// ===========================================================
+
+	// ====== 关键验证：检查dupSet中的每行是否真的从输出中被删除了 ======
+	leftoverCount := 0
+	sampleLeftover := []int{}
+	for k := range mod.DupSet {
+		rPattern := fmt.Sprintf(`r="%d"`, k)
+		rPattern2 := fmt.Sprintf(`r='%d'`, k)
+		if strings.Contains(resultStr, rPattern) || strings.Contains(resultStr, rPattern2) {
+			leftoverCount++
+			if len(sampleLeftover) < 10 {
+				sampleLeftover = append(sampleLeftover, k)
+			}
+		}
+	}
+	if leftoverCount > 0 {
+		fmt.Fprintf(os.Stderr, "[STAGE2-VERIFY] ⚠ 应删除%d行但仍有%d行残留在输出中! 样本: %v\n",
+			len(mod.DupSet), leftoverCount, sampleLeftover)
+	} else {
+		fmt.Fprintf(os.Stderr, "[STAGE2-VERIFY] ✅ 所有%d个重复行均已从输出中移除\n", len(mod.DupSet))
+	}
+	// =============================================================
+
+	diagResult := []byte(builder.String())
+	return diagResult, diag
 }
 
 // extractRowNum 从 <row r="12" ...> 提取行号
