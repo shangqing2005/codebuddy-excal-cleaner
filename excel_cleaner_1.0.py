@@ -91,6 +91,7 @@ from tkinter import filedialog, messagebox
 import threading
 import time
 import os
+import sys
 import copy
 import gc
 import shutil
@@ -2449,13 +2450,20 @@ class ExcelDeduplicationTool:
         """
         获取Go处理程序的路径。
         优先级：
-          1. 同目录下的 xlsx_shifter.exe（打包后）
-          2. xlsx_shifter 子目录下的 exe（开发调试）
+          1. PyInstaller打包后，从 sys._MEIPASS 读取
+          2. 同目录下的 xlsx_shifter.exe（开发调试/手动部署）
+          3. xlsx_shifter 子目录下的 exe
         """
-        # 获取当前脚本所在目录
+        # 1. PyInstaller打包模式
+        if getattr(sys, 'frozen', False):
+            meipass = sys._MEIPASS
+            meipass_path = os.path.join(meipass, "xlsx_shifter.exe")
+            if os.path.isfile(meipass_path):
+                return meipass_path
+
+        # 2. 脚本同目录
         base_dir = os.path.dirname(os.path.abspath(__file__))
 
-        # 可能的路径列表
         candidates = [
             os.path.join(base_dir, "xlsx_shifter.exe"),       # 打包后在同目录
             os.path.join(base_dir, "xlsx_shifter", "xlsx_shifter.exe"),  # 开发时在子目录
