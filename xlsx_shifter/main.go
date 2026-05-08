@@ -738,7 +738,19 @@ func batchShiftUpXML(xlsxPath string, mods []SheetMod) ([]Stage2SheetResult, err
 			diags = append(diags, diag)
 			writer.Write(modifiedXML)
 
+			// ====== 内存管理：释放大对象，防累积 ======
+			xmlData = nil
+			modifiedXML = nil
+
 			memMB := getMemoryMB()
+			// 内存接近阈值时主动GC回收
+			if memMB > 1000 {
+				runtime.GC()
+				memMB = getMemoryMB()
+				fmt.Fprintf(os.Stderr, "[INFO]   ⚠ 内存>1000MB(%.0fMB)，主动GC后降至%.0fMB\n",
+					memMB, getMemoryMB())
+			}
+
 			fmt.Fprintf(os.Stderr, "[INFO]   「%s」完成: 保留%d行/跳过%d重复, 内存%.0fMB\n",
 				targetMod.SheetName, diag.KeptCount, diag.SkippedCount, memMB)
 			if memMB > 1500 {
