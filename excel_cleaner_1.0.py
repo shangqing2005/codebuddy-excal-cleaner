@@ -3265,6 +3265,7 @@ class ExcelDeduplicationTool:
             self._stop_timer(total_elapsed)
 
         except InterruptedError as e:
+            self._export_log_file()
             # E011 - 用户主动取消
             cancel_err = UserCancelledError()
             self._safe_log_error(cancel_err)
@@ -3281,6 +3282,7 @@ class ExcelDeduplicationTool:
 
         # ---- 捕获所有自定义业务异常 ----
         except ExcelCleanerError as e:
+            self._export_log_file()  # 异常时也导出日志
             self._safe_log_error(e)
             # 清理残留的输出副本（仅当文件已创建时）
             if hasattr(self, '_last_output_file') and self._last_output_file:
@@ -3295,6 +3297,7 @@ class ExcelDeduplicationTool:
 
         # ---- 捕获系统级/未知异常（最终兜底） ----
         except MemoryError as e:
+            self._export_log_file()
             file_mb = os.path.getsize(file_path) / (1024*1024) if os.path.exists(file_path) else 0
             biz_err = MemoryError_(file_size_mb=file_mb)
             self._safe_log_error(biz_err, detail=str(e))
@@ -3317,6 +3320,7 @@ class ExcelDeduplicationTool:
             self._reset_timer()
 
         except Exception as e:
+            self._export_log_file()
             # 兜底：任何未预料到的异常
             biz_err, detail = self._classify_error(e, context="处理Excel", file_path=file_path)
             self._safe_log_error(biz_err, detail=detail)

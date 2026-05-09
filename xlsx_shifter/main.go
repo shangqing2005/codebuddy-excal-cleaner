@@ -1,4 +1,4 @@
-// =============================================================================
+﻿// =============================================================================
 // xlsx_shifter — Excel单元格去重核心处理程序（Go实现）
 //
 // 功能：
@@ -18,6 +18,7 @@ import (
 	"archive/zip"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
 	"reflect"
@@ -25,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/xuri/excelize/v2"
 )
@@ -178,9 +180,9 @@ func executeFullPipeline(raw map[string]interface{}) TaskResult {
 	// 根据规则模式决定去重策略
 	// multi: 所有规则共享同一个seen map（跨规则全局去重）
 	// single: 每条规则独立seen map（规则间互不影响）
-	var globalSeen map[string]struct{}
+	var globalSeen map[uint64]struct{}
 	if input.RuleMode == "multi" {
-		globalSeen = make(map[string]struct{})
+		globalSeen = make(map[uint64]struct{})
 	}
 
 	fmt.Fprintf(os.Stderr, "[INFO] === 阶段1: 流式扫描开始 ===\n")
@@ -201,15 +203,15 @@ func executeFullPipeline(raw map[string]interface{}) TaskResult {
 
 	for _, rule := range input.Rules {
 		// 单规则模式：每次创建独立的seen；多规则模式：共享globalSeen
-		var ruleSeen map[string]struct{}
+		var ruleSeen map[uint64]struct{}
 		if globalSeen != nil {
 			ruleSeen = globalSeen // 多规则：复用全局map
 		} else {
-			ruleSeen = make(map[string]struct{}) // 单规则：独立新map
+			ruleSeen = make(map[uint64]struct{}) // 单规则：独立新map
 		}
 
 		dupSet, totalRows, dups := scanDuplicates(f, rule,
-			func() map[string]struct{} { return ruleSeen }, input.SkipHeader)
+			func() map[uint64]struct{} { return ruleSeen }, input.SkipHeader)
 
 		if totalRows > 0 {
 			scanResults = append(scanResults, RuleScanResult{
@@ -226,6 +228,9 @@ func executeFullPipeline(raw map[string]interface{}) TaskResult {
 
 	f.Close()
 	f = nil
+	// 阶段1已结束，globalSeen / excelize缓存不再需要，立即释放
+	globalSeen = nil
+	runtime.GC()
 
 	fmt.Fprintf(os.Stderr, "[INFO] === 扫描阶段完成，共发现%d个重复项 ===\n", result.TotalDups)
 	fmt.Fprintf(os.Stderr, "[INFO] 当前内存: %.0fMB\n", getMemoryMB())
@@ -282,10 +287,10 @@ func executeFullPipeline(raw map[string]interface{}) TaskResult {
 					continue
 				}
 				totalRemainingDups := 0
-				verifySeen := make(map[string]struct{})
+				verifySeen := make(map[uint64]struct{})
 				for _, rule := range input.Rules {
 					_, verifyTotal, verifyDups := scanDuplicates(f2, rule,
-						func() map[string]struct{} { return verifySeen }, input.SkipHeader)
+						func() map[uint64]struct{} { return verifySeen }, input.SkipHeader)
 					if verifyTotal > 0 {
 						if verifyDups > 0 {
 							totalRemainingDups += verifyDups
@@ -313,7 +318,7 @@ func executeFullPipeline(raw map[string]interface{}) TaskResult {
 }
 
 func scanDuplicates(f *excelize.File, rule RuleDef,
-	seenProvider func() map[string]struct{}, skipHeader bool) (map[int]bool, int, int) {
+	seenProvider func() map[uint64]struct{}, skipHeader bool) (map[int]bool, int, int) {
 
 	dupSet := make(map[int]bool)
 	totalRows := 0
@@ -405,12 +410,12 @@ func scanDuplicates(f *excelize.File, rule RuleDef,
 				}
 			}
 			if matched {
-				if _, exists := seen[key]; exists {
+				if _, exists := seen[hashDedupKey(key)]; exists {
 					dupSet[physicalRow] = true // 与XML r="N" 对齐（curRow已是1-based）
 					dupCount++
 					traceLog(physicalRow, rawVal, normVal, key, true, "重复命中")
 				} else {
-					seen[key] = struct{}{}
+					seen[hashDedupKey(key)] = struct{}{}
 					traceLog(physicalRow, rawVal, normVal, key, false, "首次出现")
 				}
 				rowIdx++
@@ -419,7 +424,7 @@ func scanDuplicates(f *excelize.File, rule RuleDef,
 			}
 		}
 
-		if _, exists := seen[key]; exists {
+		if _, exists := seen[hashDedupKey(key)]; exists {
 			dupSet[physicalRow] = true // 与XML r="N" 对齐（curRow已是1-based）
 			dupCount++
 			// 采集前N个重复key样本
@@ -428,7 +433,7 @@ func scanDuplicates(f *excelize.File, rule RuleDef,
 					fmt.Sprintf("物理行r=%d:%s", physicalRow, key))
 			}
 		} else {
-			seen[key] = struct{}{}
+			seen[hashDedupKey(key)] = struct{}{}
 			// 采集首次出现的key（前N和后N）
 			if len(firstKeys) < sampleSize {
 				firstKeys = append(firstKeys, key)
@@ -592,6 +597,14 @@ func buildDedupKey(rowData []string, cols []int) string {
 	return strings.Join(parts, "\x00")
 }
 
+// hashDedupKey 将去重key哈希为uint64，减少seen map内存占用
+// 原始key（公司名）可能>20字节，哈希后固定8字节
+func hashDedupKey(key string) uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(key))
+	return h.Sum64()
+}
+
 func maxOfInts(nums ...int) int {
 	maxV := -1
 	for _, n := range nums {
@@ -738,24 +751,15 @@ func batchShiftUpXML(xlsxPath string, mods []SheetMod) ([]Stage2SheetResult, err
 			diags = append(diags, diag)
 			writer.Write(modifiedXML)
 
-			// ====== 内存管理：释放大对象，防累积 ======
+			// ====== 内存管理：释放大对象，每sheet后立即GC ======
 			xmlData = nil
 			modifiedXML = nil
+			runtime.GC() // 每个sheet后立即回收，保证下一个sheet的内存
 
 			memMB := getMemoryMB()
-			// 内存接近阈值时主动GC回收
-			if memMB > 1000 {
-				runtime.GC()
-				memMB = getMemoryMB()
-				fmt.Fprintf(os.Stderr, "[INFO]   ⚠ 内存>1000MB(%.0fMB)，主动GC后降至%.0fMB\n",
-					memMB, getMemoryMB())
-			}
 
-			fmt.Fprintf(os.Stderr, "[INFO]   「%s」完成: 保留%d行/跳过%d重复, 内存%.0fMB\n",
-				targetMod.SheetName, diag.KeptCount, diag.SkippedCount, memMB)
-			if memMB > 1500 {
-				return diags, fmt.Errorf("内存过高(%.0fMB)，建议拆分文件", memMB)
-			}
+		fmt.Fprintf(os.Stderr, "[INFO]   「%s」完成: 保留%d行/跳过%d重复, 内存%.0fMB\n",
+			targetMod.SheetName, diag.KeptCount, diag.SkippedCount, memMB)
 		} else {
 			rc, _ := srcFile.Open()
 			if rc != nil {
@@ -925,8 +929,11 @@ func extractSheetsOld(wb string, result map[string]string) {
 //
 //	重复行的整个 <row> 块删除 → 和 Python ElementTree 移动效果一致
 func shiftUpSheetXML(xmlData []byte, mod SheetMod) ([]byte, Stage2SheetResult) {
-	content := string(xmlData)
-	
+	content := unsafe.String(&xmlData[0], len(xmlData))
+	if len(xmlData) == 0 {
+		content = ""
+	}
+
 	fmt.Fprintf(os.Stderr, "[START] 开始处理SheetXML，数据大小=%d字节, 重复数=%d\n", len(content), mod.DupCount)
 
 	// 定位 <sheetData> ... </sheetData> 区域
