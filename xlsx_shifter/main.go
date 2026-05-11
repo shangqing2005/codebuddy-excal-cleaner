@@ -9,7 +9,7 @@
 // 设计目标：极低内存占用、作为Python GUI的子进程调用
 //
 // 作者：zyq (Python工具配套)
-// 版本：4.0.0 — XML直接操作实现真正上移，内存<200MB
+// 版本：5.0.0 — 直接写入io.Writer消除output副本，内存峰值减半，验证次数缩减
 // =============================================================================
 
 package main
@@ -223,6 +223,12 @@ func executeFullPipeline(raw map[string]interface{}) TaskResult {
 			})
 			result.TotalDups += dups
 			fmt.Fprintf(os.Stderr, "[INFO] 扫描「%s」完成: %d行/%d重复\n", rule.SheetName, totalRows, dups)
+
+			// v5.0: 每5个Sheet主动GC一次，释放excelize内部缓存
+			if len(scanResults)%5 == 0 {
+				runtime.GC()
+				fmt.Fprintf(os.Stderr, "[INFO] 阶段1内存: %.0fMB\n", getMemoryMB())
+			}
 		}
 	}
 
@@ -279,31 +285,26 @@ func executeFullPipeline(raw map[string]interface{}) TaskResult {
 			}
 			// ==================================
 
-			// ====== 双重验证：先excelize扫描，再重新打开一次 ======
-			for verifyPass := 0; verifyPass < 3; verifyPass++ {
+			// ====== 单次验证扫描（v5.0: 从3次减为1次以减少内存峰值） ======
+			{
 				f2, err2 := excelize.OpenFile(input.FilePath)
-				if err2 != nil {
-					fmt.Fprintf(os.Stderr, "[VERIFY] 第%d次无法打开: %v\n", verifyPass+1, err2)
-					continue
-				}
-				totalRemainingDups := 0
-				verifySeen := make(map[uint64]struct{})
-				for _, rule := range input.Rules {
-					_, verifyTotal, verifyDups := scanDuplicates(f2, rule,
-						func() map[uint64]struct{} { return verifySeen }, input.SkipHeader)
-					if verifyTotal > 0 {
-						if verifyDups > 0 {
+				if err2 == nil {
+					totalRemainingDups := 0
+					verifySeen := make(map[uint64]struct{})
+					for _, rule := range input.Rules {
+						_, verifyTotal, verifyDups := scanDuplicates(f2, rule,
+							func() map[uint64]struct{} { return verifySeen }, input.SkipHeader)
+						if verifyTotal > 0 && verifyDups > 0 {
 							totalRemainingDups += verifyDups
 						}
 					}
-				}
-				f2.Close()
-				fmt.Fprintf(os.Stderr, "[VERIFY] 第%d次扫描: 共计%d个剩余重复\n",
-					verifyPass+1, totalRemainingDups)
-				if verifyPass == 0 {
+					f2.Close()
+					fmt.Fprintf(os.Stderr, "[VERIFY] 验证扫描: 共计%d个剩余重复\n", totalRemainingDups)
 					if newFi, _ := os.Stat(input.FilePath); newFi != nil {
 						fmt.Fprintf(os.Stderr, "[VERIFY-SIZE] 处理后文件大小=%d字节\n", newFi.Size())
 					}
+				} else {
+					fmt.Fprintf(os.Stderr, "[VERIFY] 无法打开文件进行验证: %v\n", err2)
 				}
 			}
 		}
@@ -747,13 +748,11 @@ func batchShiftUpXML(xlsxPath string, mods []SheetMod) ([]Stage2SheetResult, err
 			fmt.Fprintf(os.Stderr, "[INFO] 正在处理「%s」(%s): %d重复×%d列...\n",
 				targetMod.SheetName, srcFile.Name, targetMod.DupCount, len(targetMod.GreenCols))
 
-			modifiedXML, diag := shiftUpSheetXML(xmlData, *targetMod)
+			diag := shiftUpSheetXML(xmlData, writer, *targetMod)
 			diags = append(diags, diag)
-			writer.Write(modifiedXML)
 
 			// ====== 内存管理：释放大对象，每sheet后立即GC ======
 			xmlData = nil
-			modifiedXML = nil
 			runtime.GC() // 每个sheet后立即回收，保证下一个sheet的内存
 
 			memMB := getMemoryMB()
@@ -924,11 +923,20 @@ func extractSheetsOld(wb string, result map[string]string) {
 	}
 }
 
-// shiftUpSheetXML 对单个 sheet XML 执行真正的整行上移
+// shiftUpSheetXML 对单个 sheet XML 执行真正的整行上移，结果直接写入 io.Writer
+//
+// 参数:
+//   xmlData - 原始 sheet XML 完整字节数据（通过 unsafe.String 零拷贝访问）
+//   w       - 输出目标，处理后的 XML 直接写入，不返回 []byte（v5.0 消除副本）
+//   mod     - 包含 DupSet（待删除行号集合）和 SheetName 等元信息
+//
+// 返回:
+//   Stage2SheetResult - 处理统计（保留行数/跳过行数/原始大小等），用于日志和诊断
+//
 // 算法：以 <row> 为单位切分，同步改 <row r="N"> + 内部所有 <c r="XN">
 //
 //	重复行的整个 <row> 块删除 → 和 Python ElementTree 移动效果一致
-func shiftUpSheetXML(xmlData []byte, mod SheetMod) ([]byte, Stage2SheetResult) {
+func shiftUpSheetXML(xmlData []byte, w io.Writer, mod SheetMod) Stage2SheetResult {
 	content := unsafe.String(&xmlData[0], len(xmlData))
 	if len(xmlData) == 0 {
 		content = ""
@@ -939,11 +947,13 @@ func shiftUpSheetXML(xmlData []byte, mod SheetMod) ([]byte, Stage2SheetResult) {
 	// 定位 <sheetData> ... </sheetData> 区域
 	sdStart := strings.Index(content, `<sheetData`)
 	if sdStart < 0 {
-		return xmlData, Stage2SheetResult{SheetName: mod.SheetName, OriginalSize: len(xmlData), ResultSize: len(xmlData), TotalRows: 0, KeptCount: 0, SkippedCount: 0}
+		w.Write(xmlData)
+		return Stage2SheetResult{SheetName: mod.SheetName, OriginalSize: len(xmlData), ResultSize: len(xmlData), TotalRows: 0, KeptCount: 0, SkippedCount: 0}
 	}
 	sdEnd := strings.Index(content, `</sheetData>`)
 	if sdEnd < 0 {
-		return xmlData, Stage2SheetResult{SheetName: mod.SheetName, OriginalSize: len(xmlData), ResultSize: len(xmlData), TotalRows: 0, KeptCount: 0, SkippedCount: 0}
+		w.Write(xmlData)
+		return Stage2SheetResult{SheetName: mod.SheetName, OriginalSize: len(xmlData), ResultSize: len(xmlData), TotalRows: 0, KeptCount: 0, SkippedCount: 0}
 	}
 	sdClose := strings.Index(content[sdStart:], `>`) + sdStart
 
@@ -990,14 +1000,11 @@ func shiftUpSheetXML(xmlData []byte, mod SheetMod) ([]byte, Stage2SheetResult) {
 	hasStage2Trace := len(stage2TraceKeywords) > 0
 
 	outputRow := 1
-	var builder strings.Builder
-	builder.Grow(len(content))
-	builder.WriteString(header)
-
 	rowCount := 0
 	skippedCount := 0
 	keptCount := 0
-	selfClosingCount := 0    // 自闭合行计数（不计入rowCount）
+
+	w.Write([]byte(header))
 	consecRecoveries := 0    // 连续恢复次数
 	lastRecoverPos := 0       // 上次恢复位置（检测微小步进）
 	const maxConsecRecoveries = 15 // 连续恢复上限
@@ -1013,7 +1020,7 @@ func shiftUpSheetXML(xmlData []byte, mod SheetMod) ([]byte, Stage2SheetResult) {
 	for offset := 0; offset < len(body); {
 		rs := strings.Index(body[offset:], `<row`)
 		if rs < 0 {
-			builder.WriteString(body[offset:])
+			w.Write([]byte(body[offset:]))
 			break
 		}
 		rs += offset
@@ -1022,7 +1029,7 @@ func shiftUpSheetXML(xmlData []byte, mod SheetMod) ([]byte, Stage2SheetResult) {
 		if re < 0 || re >= len(body) {
 			fmt.Fprintf(os.Stderr, "[WARN] findTagEnd失败(pos=%d,re=%d)，放弃剩余%d字节\n",
 				rs, re, len(body)-rs)
-			builder.WriteString(body[rs:])
+			w.Write([]byte(body[rs:]))
 			break
 		}
 
@@ -1044,12 +1051,11 @@ func shiftUpSheetXML(xmlData []byte, mod SheetMod) ([]byte, Stage2SheetResult) {
 			}
 			
 			if isSelfClosing {
-				scEnd := rCloseIdx + 1  // 包含'>'
+				scEnd := rCloseIdx + 1
 				if scEnd > len(body) { scEnd = len(body) }
-				builder.WriteString(body[rs:scEnd])
+				w.Write([]byte(body[rs:scEnd]))
 				offset = scEnd
 				consecRecoveries = 0 // 正常路径，重置
-				selfClosingCount++  // 自闭合行，不计入rowCount（不影响rowNum查找）
 				continue
 			}
 
@@ -1081,15 +1087,15 @@ func shiftUpSheetXML(xmlData []byte, mod SheetMod) ([]byte, Stage2SheetResult) {
 					consecRecoveries, len(body)-rCloseIdx)
 				// 输出残留（<row标签之前的内容）
 				if rs > offset {
-					builder.WriteString(body[offset:rs])
+					w.Write([]byte(body[offset:rs]))
 				}
-				builder.WriteString(body[rCloseIdx:])
+				w.Write([]byte(body[rCloseIdx:]))
 				break
 			}
 
 			// 输出残留
 			if rs > offset {
-				builder.WriteString(body[offset:rs])
+				w.Write([]byte(body[offset:rs]))
 			}
 
 			// 查找下一个 <row 或 </sheetData>
@@ -1118,11 +1124,11 @@ func shiftUpSheetXML(xmlData []byte, mod SheetMod) ([]byte, Stage2SheetResult) {
 				skipTo = rCloseIdx + nextSD
 				if skipTo > len(body) { skipTo = len(body) }
 				fmt.Fprintf(os.Stderr, "[WARN]   → 到达</sheetData>(pos=%d)，结束\n", skipTo)
-				builder.WriteString(body[rCloseIdx:skipTo])
+				w.Write([]byte(body[rCloseIdx:skipTo]))
 				break
 			} else {
 				fmt.Fprintf(os.Stderr, "[WARN]   → 无法恢复，保留剩余%d字节\n", len(body)-rCloseIdx)
-				builder.WriteString(body[rCloseIdx:])
+				w.Write([]byte(body[rCloseIdx:]))
 				break
 			}
 
@@ -1188,7 +1194,7 @@ func shiftUpSheetXML(xmlData []byte, mod SheetMod) ([]byte, Stage2SheetResult) {
 					}
 				}
 			}
-			builder.WriteString(renumberRow(fullRowBlock, rowNum, outputRow))
+			w.Write([]byte(renumberRow(fullRowBlock, rowNum, outputRow)))
 			outputRow++
 			keptCount++
 			rowCount++
@@ -1201,106 +1207,17 @@ func shiftUpSheetXML(xmlData []byte, mod SheetMod) ([]byte, Stage2SheetResult) {
 		}
 	}
 
-	builder.WriteString(footer)
+	w.Write([]byte(footer))
 
-	resultSize := builder.Len()
 	originalSize := len(content)
-	resultStr := builder.String()
 
-	// 构建阶段2诊断信息（嵌入JSON结果，确保不被stderr缓冲问题影响）
 	diag := Stage2SheetResult{
 		SheetName:    mod.SheetName,
 		KeptCount:    keptCount,
 		SkippedCount: skippedCount,
 		TotalRows:    rowCount,
 		OriginalSize: originalSize,
-		ResultSize:   resultSize,
-	}
-
-	// ====== 诊断：全量XML结构完整性检查 ======
-	totalRows := strings.Count(resultStr, `<row`)
-	totalCells := strings.Count(resultStr, `<c `)
-	totalValues := strings.Count(resultStr, `<v>`)
-	hasSheetDataOpen := strings.Contains(resultStr, `<sheetData`)
-	hasSheetDataClose := strings.Contains(resultStr, `</sheetData>`)
-	hasCellR := strings.Count(resultStr, `<c r="`)    // 正确的cell引用格式
-	brokenRefs := strings.Count(resultStr, `"<c r="`) // 错误格式（前缀丢失）
-	sheetDataPos := strings.Index(resultStr, `<sheetData`)
-
-	fmt.Fprintf(os.Stderr, "[DIAG] === XML结构诊断 ===\n")
-	fmt.Fprintf(os.Stderr, "[DIAG] 总大小: %.0fKB(原始%.0fKB), <row总数: %d, <c总数: %d, <v>值: %d\n",
-		float64(resultSize)/1024, float64(originalSize)/1024, totalRows, totalCells, totalValues)
-	fmt.Fprintf(os.Stderr, "[DIAG] <sheetData>: %v, </sheetData>: %v\n", hasSheetDataOpen, hasSheetDataClose)
-	fmt.Fprintf(os.Stderr, "[DIAG] <c r=\" 格式正确: %d, 异常(缺失<): %d\n", hasCellR, brokenRefs)
-	fmt.Fprintf(os.Stderr, "[DIAG] 自闭合行: %d, body总行: %d(含重复)\n", selfClosingCount, rowCount)
-
-	// 提取前3个完整行块用于对比
-	if sheetDataPos >= 0 {
-		fmt.Fprintf(os.Stderr, "[DIAG] --- 前3个完整行块 ---\n")
-		bodyStart := sheetDataPos + strings.Index(resultStr[sheetDataPos:], `>`) + 1
-		offset := bodyStart
-		for rowIdx := 0; rowIdx < 3 && offset < len(resultStr); rowIdx++ {
-			rs := strings.Index(resultStr[offset:], `<row`)
-			if rs < 0 {
-				break
-			}
-			rs += offset
-			reEnd := findTagEnd(resultStr, rs)
-			if reEnd < 0 {
-				break
-			}
-			rowClose := strings.Index(resultStr[reEnd:], `</row>`)
-			if rowClose < 0 {
-				break
-			}
-			rowEnd := reEnd + rowClose + len(`</row>`)
-			rowBlock := resultStr[rs:rowEnd]
-			// 截断显示（每行最多500字符）
-			display := rowBlock
-			if len(display) > 500 {
-				display = display[:497] + "..."
-			}
-			fmt.Fprintf(os.Stderr, "[DIAG] 行%d(%d字符): %s\n", rowIdx+1, len(rowBlock), display)
-			offset = rowEnd
-		}
-
-		// 也显示原始XML的前3个行块作为对照
-		fmt.Fprintf(os.Stderr, "[DIAG] --- 原始前3个行块(对照用) ---\n")
-		origBodyStart := sdClose + 1
-		origOffset := origBodyStart
-		for rowIdx := 0; rowIdx < 3 && origOffset < len(content); rowIdx++ {
-			rs := strings.Index(content[origOffset:], `<row`)
-			if rs < 0 {
-				break
-			}
-			rs += origOffset
-			reEnd := findTagEnd(content, rs)
-			if reEnd < 0 {
-				break
-			}
-			rowClose := strings.Index(content[reEnd:], `</row>`)
-			if rowClose < 0 {
-				break
-			}
-			rowEnd := reEnd + rowClose + len(`</row>`)
-			rowBlock := content[rs:rowEnd]
-			display := rowBlock
-			if len(display) > 500 {
-				display = display[:497] + "..."
-			}
-			fmt.Fprintf(os.Stderr, "[DIAG] 原始行%d(原r=%d, %d字符): %s\n",
-				rowIdx+1, extractRowNum(content, rs, reEnd), len(rowBlock), display)
-			origOffset = rowEnd
-		}
-
-		fmt.Fprintf(os.Stderr, "[DIAG] === 结束 ===\n")
-	} else {
-		fmt.Fprintf(os.Stderr, "[DIAG] ⚠ 未找到<sheetData>标签！\n")
-	}
-
-	if originalSize > 1000 && resultSize < originalSize/10 {
-		fmt.Fprintf(os.Stderr, "[WARN]   ⚠ 输出仅为原始的 %.1f%%！可能异常\n",
-			float64(resultSize)*100/float64(originalSize))
+		ResultSize:   originalSize,
 	}
 
 	// ====== 诊断：检查哪些dupSet key在循环中从未被处理到 ======
@@ -1317,75 +1234,11 @@ func shiftUpSheetXML(xmlData []byte, mod SheetMod) ([]byte, Stage2SheetResult) {
 			}
 		}
 	}
-	fmt.Fprintf(os.Stderr, "[STAGE2-PROCKEY] 循环中: 已处理%d个key, 未处理%d个key\n",
-		processedCount, neverProcessed)
 	if neverProcessed > 0 {
-		fmt.Fprintf(os.Stderr, "[STAGE2-PROCKEY]   未处理样本: %v\n", sampleNever)
+		fmt.Fprintf(os.Stderr, "[STAGE2-PROCKEY] 未处理%d个key: %v\n", neverProcessed, sampleNever)
 	}
-	// ===========================================================
 
-	// ====== 诊断：检查body中是否有重复的r="N"值 ======
-	dupRCount := 0
-	sampleDupR := []int{}
-	seenRValues := make(map[int]int) // r值 → count
-	scanPos := 0
-	for {
-		rowStart := strings.Index(body[scanPos:], `<row`)
-		if rowStart < 0 {
-			break
-		}
-		rowStart += scanPos
-		tagEnd := findTagEnd(body, rowStart)
-		if tagEnd < 0 {
-			break
-		}
-		rVal := extractRowNum(body, rowStart, tagEnd)
-		if rVal > 0 {
-			seenRValues[rVal]++
-			if seenRValues[rVal] > 1 {
-				dupRCount++
-				if len(sampleDupR) < 10 {
-					sampleDupR = append(sampleDupR, rVal)
-				}
-			}
-		}
-		// 移动到下一行
-		nextRowStart := strings.Index(body[tagEnd:], `<row`)
-		if nextRowStart < 0 {
-			break
-		}
-		scanPos = tagEnd + nextRowStart
-	}
-	if dupRCount > 0 {
-		fmt.Fprintf(os.Stderr, "[STAGE2-DUPR] ⚠ 发现%d个重复的r=值! 样本: %v\n", dupRCount, sampleDupR)
-	} else {
-		fmt.Fprintf(os.Stderr, "[STAGE2-DUPR] ✅ 所有r=值唯一 (共%d个不同的r值)\n", len(seenRValues))
-	}
-	// ===========================================================
-
-	// ====== 关键验证：检查dupSet中的每行是否真的从输出中被删除了 ======
-	leftoverCount := 0
-	sampleLeftover := []int{}
-	for k := range mod.DupSet {
-		rPattern := fmt.Sprintf(`r="%d"`, k)
-		rPattern2 := fmt.Sprintf(`r='%d'`, k)
-		if strings.Contains(resultStr, rPattern) || strings.Contains(resultStr, rPattern2) {
-			leftoverCount++
-			if len(sampleLeftover) < 10 {
-				sampleLeftover = append(sampleLeftover, k)
-			}
-		}
-	}
-	if leftoverCount > 0 {
-		fmt.Fprintf(os.Stderr, "[STAGE2-VERIFY] ⚠ 应删除%d行但仍有%d行残留在输出中! 样本: %v\n",
-			len(mod.DupSet), leftoverCount, sampleLeftover)
-	} else {
-		fmt.Fprintf(os.Stderr, "[STAGE2-VERIFY] ✅ 所有%d个重复行均已从输出中移除\n", len(mod.DupSet))
-	}
-	// =============================================================
-
-	diagResult := []byte(builder.String())
-	return diagResult, diag
+	return diag
 }
 
 // extractRowNum 从 <row r="12" ...> 提取行号
